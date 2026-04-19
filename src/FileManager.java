@@ -2,11 +2,13 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Set;
+import java.util.concurrent.ThreadLocalRandom;
 
 class FileManager {
 
-    private final int selfPeerId;
     private final Config.CommonConfig commonConfig;
     private final Path peerDir;
     private final Path fullFilePath;
@@ -16,7 +18,6 @@ class FileManager {
     private int ownedPieceCount;
 
     public FileManager(int selfPeerId, boolean startsWithFile, Config.CommonConfig commonConfig) throws IOException {
-        this.selfPeerId = selfPeerId;
         this.commonConfig = commonConfig;
         this.peerDir = Paths.get("peer_" + selfPeerId);
         this.fullFilePath = peerDir.resolve(commonConfig.fileName());
@@ -44,7 +45,6 @@ class FileManager {
         for (int i = 0; i < hasPiece.length; i++) {
             int start = i * pieceSize;
             int end = Math.min(start + pieceSize, allBytes.length);
-
             int len = end - start;
             byte[] piece = new byte[len];
             System.arraycopy(allBytes, start, piece, 0, len);
@@ -67,7 +67,7 @@ class FileManager {
     }
 
     public synchronized boolean savePiece(int pieceIndex, byte[] pieceData) {
-        if (pieceIndex < 0 || pieceIndex >= hasPiece.length) {
+        if (pieceIndex < 0 || pieceIndex >= hasPiece.length || pieceData == null) {
             return false;
         }
         if (hasPiece[pieceIndex]) {
@@ -113,6 +113,10 @@ class FileManager {
         return ownedPieceCount;
     }
 
+    public synchronized int getTotalPieces() {
+        return hasPiece.length;
+    }
+
     public synchronized boolean[] getLocalBitfield() {
         boolean[] copy = new boolean[hasPiece.length];
         System.arraycopy(hasPiece, 0, copy, 0, hasPiece.length);
@@ -140,7 +144,6 @@ class FileManager {
         for (int i = 0; i < result.length; i++) {
             int byteIndex = i / 8;
             int bitIndex = 7 - (i % 8);
-
             if (byteIndex < payload.length) {
                 result[i] = ((payload[byteIndex] >> bitIndex) & 1) == 1;
             }
@@ -150,11 +153,18 @@ class FileManager {
     }
 
     public synchronized int chooseNeededPiece(boolean[] remoteBitfield, Set<Integer> reservedPieces) {
+        List<Integer> candidates = new ArrayList<>();
         for (int i = 0; i < hasPiece.length; i++) {
             if (!hasPiece[i] && remoteBitfield[i] && !reservedPieces.contains(i)) {
-                return i;
+                candidates.add(i);
             }
         }
-        return -1;
+
+        if (candidates.isEmpty()) {
+            return -1;
+        }
+
+        int randomIndex = ThreadLocalRandom.current().nextInt(candidates.size());
+        return candidates.get(randomIndex);
     }
 }

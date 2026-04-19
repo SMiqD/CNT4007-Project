@@ -63,6 +63,11 @@ class NeighborManager {
         neighbors.get(peerId).bitfield[pieceIndex] = value;
     }
 
+    public boolean isNeighborComplete(int peerId) {
+        ensureNeighbor(peerId);
+        return neighbors.get(peerId).hasCompleteFile();
+    }
+
     public void setInterestedInMe(int peerId, boolean value) {
         ensureNeighbor(peerId);
         neighbors.get(peerId).interestedInMe = value;

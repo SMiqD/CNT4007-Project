@@ -25,6 +25,12 @@ public class peerProcess {
     private final Map<Integer, ConnectionHandler> connections = new ConcurrentHashMap<>();
     private final Set<Integer> requestedPieces = ConcurrentHashMap.newKeySet();
 
+    // Tracks which peer a reserved/requested piece is currently tied to
+    private final Map<Integer, Integer> requestedPieceOwners = new ConcurrentHashMap<>();
+
+    // NEW: persistent completion tracking for all peers
+    private final Map<Integer, Boolean> peerCompletionStatus = new ConcurrentHashMap<>();
+
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
 
     private volatile boolean completionLogged = false;
@@ -33,9 +39,12 @@ public class peerProcess {
     private volatile List<Integer> lastPreferredNeighbors = new ArrayList<>();
     private volatile Integer lastOptimisticNeighbor = null;
 
+    // NEW: keep the server socket as a field so shutdown can close it
+    private volatile ServerSocket serverSocket;
+
     public peerProcess(int selfPeerId,
-                    Config.CommonConfig commonConfig,
-                    List<Config.PeerInfo> peers) throws IOException {
+                       Config.CommonConfig commonConfig,
+                       List<Config.PeerInfo> peers) throws IOException {
         this.selfPeerId = selfPeerId;
         this.commonConfig = commonConfig;
         this.peers = peers;
@@ -48,6 +57,8 @@ public class peerProcess {
         this.fileManager = new FileManager(selfPeerId, selfInfo.hasFile(), commonConfig);
         this.neighborManager = new NeighborManager(selfPeerId, commonConfig.totalPieces());
         this.logger = new Logger(selfPeerId);
+
+        initializeCompletionTracking();
     }
 
     public static void main(String[] args) {
@@ -68,13 +79,27 @@ public class peerProcess {
         }
     }
 
+    private void initializeCompletionTracking() {
+        for (Config.PeerInfo peer : peers) {
+            peerCompletionStatus.put(peer.peerId(), peer.hasFile());
+        }
+
+        // self may already have complete file, or may not
+        peerCompletionStatus.put(selfPeerId, fileManager.hasCompleteFile());
+
+        if (fileManager.hasCompleteFile()) {
+            completionLogged = true; // seeder starts complete; do not log "downloaded complete file"
+        }
+    }
+
     public void start() throws IOException {
         startServerThread();
         connectToPreviousPeers();
         startSchedulers();
 
         while (running) {
-            sleepSilently(1000L);
+            sleepSilently(500L);
+
             if (allPeersComplete()) {
                 running = false;
             }
@@ -85,7 +110,9 @@ public class peerProcess {
 
     private void startServerThread() {
         Thread serverThread = new Thread(() -> {
-            try (ServerSocket serverSocket = new ServerSocket(selfInfo.port())) {
+            try {
+                serverSocket = new ServerSocket(selfInfo.port());
+
                 while (running) {
                     Socket socket = serverSocket.accept();
                     ConnectionHandler handler = new ConnectionHandler(this, socket, false, null);
@@ -137,6 +164,10 @@ public class peerProcess {
     }
 
     private void reselectPreferredNeighbors() {
+        if (!running) {
+            return;
+        }
+
         try {
             List<Integer> preferred = neighborManager.pickPreferredNeighbors(
                     commonConfig.numberOfPreferredNeighbors(),
@@ -178,6 +209,10 @@ public class peerProcess {
     }
 
     private void reselectOptimisticNeighbor() {
+        if (!running) {
+            return;
+        }
+
         try {
             Integer optimistic = neighborManager.pickOptimisticNeighbor();
             neighborManager.setOptimisticNeighbor(optimistic);
@@ -213,11 +248,28 @@ public class peerProcess {
 
     public synchronized void removeConnection(int remotePeerId) {
         connections.remove(remotePeerId);
+
+        // Release any requested pieces that were tied to this peer
+        List<Integer> toRelease = new ArrayList<>();
+        for (Map.Entry<Integer, Integer> entry : requestedPieceOwners.entrySet()) {
+            if (entry.getValue() == remotePeerId) {
+                toRelease.add(entry.getKey());
+            }
+        }
+
+        for (Integer pieceIndex : toRelease) {
+            requestedPieceOwners.remove(pieceIndex);
+            requestedPieces.remove(pieceIndex);
+        }
     }
 
     public void onBitfieldReceived(int remotePeerId, byte[] payload) {
         boolean[] bitfield = fileManager.bitfieldFromPayload(payload);
         neighborManager.setBitfield(remotePeerId, bitfield);
+
+        if (isBitfieldComplete(bitfield)) {
+            markPeerComplete(remotePeerId);
+        }
 
         if (neighborManager.remoteHasInterestingPiece(remotePeerId, fileManager.getLocalBitfield())) {
             sendInterested(remotePeerId);
@@ -229,6 +281,10 @@ public class peerProcess {
     public void onHaveReceived(int remotePeerId, int pieceIndex) {
         neighborManager.setNeighborPiece(remotePeerId, pieceIndex, true);
         logger.logHaveReceived(remotePeerId, pieceIndex);
+
+        if (neighborManager.isNeighborComplete(remotePeerId)) {
+            markPeerComplete(remotePeerId);
+        }
 
         if (!fileManager.hasPiece(pieceIndex)) {
             sendInterested(remotePeerId);
@@ -245,11 +301,29 @@ public class peerProcess {
     public void onNotInterestedReceived(int remotePeerId) {
         neighborManager.setInterestedInMe(remotePeerId, false);
         logger.logNotInterestedReceived(remotePeerId);
-    }
 
+    // If I already have the complete file, and this neighbor is not interested in me,
+    // then the neighbor must also have the complete file.
+        if (fileManager.hasCompleteFile()) {
+            markPeerComplete(remotePeerId);
+        }
+    }
     public void onChokedBy(int remotePeerId) {
         neighborManager.setChokedBy(remotePeerId, true);
         logger.logChokedBy(remotePeerId);
+
+        // Release pending requests tied to this peer, because a requested piece may never arrive
+        List<Integer> toRelease = new ArrayList<>();
+        for (Map.Entry<Integer, Integer> entry : requestedPieceOwners.entrySet()) {
+            if (entry.getValue() == remotePeerId) {
+                toRelease.add(entry.getKey());
+            }
+        }
+
+        for (Integer pieceIndex : toRelease) {
+            requestedPieceOwners.remove(pieceIndex);
+            requestedPieces.remove(pieceIndex);
+        }
     }
 
     public void onUnchokedBy(int remotePeerId) {
@@ -276,6 +350,7 @@ public class peerProcess {
 
     public void onPieceReceived(int remotePeerId, int pieceIndex, byte[] pieceData) {
         requestedPieces.remove(pieceIndex);
+        requestedPieceOwners.remove(pieceIndex);
 
         boolean added = fileManager.savePiece(pieceIndex, pieceData);
         if (!added) {
@@ -289,6 +364,7 @@ public class peerProcess {
 
         if (fileManager.hasCompleteFile() && !completionLogged) {
             completionLogged = true;
+            markPeerComplete(selfPeerId);
             logger.logCompleteFile();
         }
 
@@ -320,6 +396,8 @@ public class peerProcess {
         }
 
         requestedPieces.add(pieceIndex);
+        requestedPieceOwners.put(pieceIndex, remotePeerId);
+
         ConnectionHandler handler = connections.get(remotePeerId);
         if (handler != null) {
             handler.sendMessage(Message.buildRequest(pieceIndex));
@@ -357,19 +435,50 @@ public class peerProcess {
         }
     }
 
-    public boolean allPeersComplete() {
-        if (!fileManager.hasCompleteFile()) {
+    private void markPeerComplete(int peerId) {
+        peerCompletionStatus.put(peerId, true);
+    }
+
+    private boolean isBitfieldComplete(boolean[] bitfield) {
+        if (bitfield == null) {
             return false;
         }
-        return neighborManager.allNeighborsComplete(peers.size() - 1);
+
+        for (boolean piece : bitfield) {
+            if (!piece) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    public boolean allPeersComplete() {
+        for (Config.PeerInfo peer : peers) {
+            Boolean done = peerCompletionStatus.get(peer.peerId());
+            if (done == null || !done) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private void shutdown() {
+        running = false;
+
         scheduler.shutdownNow();
-        logger.close();
+
+        try {
+            if (serverSocket != null && !serverSocket.isClosed()) {
+                serverSocket.close();
+            }
+        } catch (IOException ignored) {
+        }
+
         for (ConnectionHandler handler : connections.values()) {
             handler.closeSilently();
         }
+
+        logger.close();
     }
 
     public int getSelfPeerId() {
